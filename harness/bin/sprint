@@ -1,0 +1,487 @@
+#!/bin/bash
+# harness/bin/sprint — sprint state management (the only writer of .sprint/flags.json) and task execution
+#
+# edit-scope-gate.sh denies direct edits to flags.json.
+# Do every stage transition, new sprint, and active switch through this script.
+# The /sprint skill also calls this script.
+#
+# Main purpose: block stage skips in transitions.
+#   Advance allows only "the next allowed transition". Going back (rollback to an earlier stage) is always allowed.
+#   Rollback to PLAN = the path to fix spec defects.
+#   Seal (spec-seal) after REVIEW and before build-red (REVIEW audits the unsealed draft
+#   independently, the findings are applied, and then the seal freezes it). The build-red gate enforces the seal.
+#
+# Subcommands (state):
+#   stage <STAGE>           transition the stage of the active sprint (checks the transition rules)
+#   set-status <STATUS>     update the status of the active sprint (open|doing|closed)
+#   new <id> <dir> [kind]   create a new sprint (copies the templates, switches active)
+#   switch <id>             switch the active sprint
+#   get [<field>]           print a value of the active sprint (stage when field is omitted)
+#   status [--json]         show the aggregated state of the active sprint
+#                           (stage / seal / test failures / freshness of execution evidence / recent transitions)
+#   list                    list all sprints
+#   log                     aggregate the stage transition log (observe rollbacks and gate failures)
+#   set-kind / set-dir / rename
+#
+# Subcommands (run. task contract):
+#   run <task>|all [<component>] [-- <extra args>...]
+#                           launch the adapters in the order of tasks in the config and write the evidence contract JSON
+#
+# Subcommands (checks. the single entry point for the process tools):
+#   gate <STAGE>            run a stage gate by hand (harness/tools/gate-check.sh)
+#   seal                    seal SPEC.md / TEST.md (harness/tools/spec-seal.sh seal)
+#   seal-verify             verify the seal hashes (harness/tools/spec-seal.sh verify)
+#   spec-lint [check ...]   machine checks of the spec (harness/gate-tools/spec-lint.sh)
+#   spec-graph [args ...]   clause reference graph (harness/tools/spec-graph.sh. no args = verify)
+#   spec-coverage [args ...] clause reference coverage cov / rcov / tcov (harness/tools/spec-coverage.sh. metrics. never fails)
+#   api-routes              two-way comparison of the public route sets (harness/tools/api-routes.sh verify)
+#   size-audit              list the files over the size limit (harness/gate-tools/size-audit.sh)
+#   spec-check [dir]        structure check of SPEC.md / TEST.md (harness/tools/spec-check.sh)
+
+set -euo pipefail
+export PATH="${PATH:+$PATH:}/usr/local/bin:/usr/bin:/bin"   # prefer the caller's PATH; guarantee the basic commands even in the minimal hook environment
+
+HARNESS="$(dirname "$(readlink -f "$0")")/.."
+. "$HARNESS/lib/env.sh"
+. "$HARNESS/lib/evidence.sh"
+sprint_config_require
+ROOT=$(sprint_root)
+FLAGS="$ROOT/.sprint/flags.json"
+
+die() { echo "sprint: $*" >&2; exit 1; }
+now() { sprint_date +%Y-%m-%dT%H:%M:%S%:z; }
+
+# ── transition log ──
+# Append one line to .sprint/logs/stage-transitions.jsonl.
+# Collect observation data of the process itself (how many rollbacks per stage, how many failures per gate)
+# so that the improvement targets can be found by numbers afterwards. Show it with `bash harness/bin/sprint log`.
+# Invariant: a failure to record does not stop sprint.sh (it always returns success).
+# The output is pino NDJSON (to read it with `tail -F * | pino-pretty`).
+# level is 40 (warn) only when gate=fail. This makes it easy to find by eye.
+log_transition() { # <sprint_id> <from> <to> <direction> <gate>
+  local dir="$ROOT/.sprint/logs"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  local ms; ms=$(date +%s%3N 2>/dev/null)
+  case "$ms" in ''|*[!0-9]*) ms=$(( $(date +%s 2>/dev/null) * 1000 )) ;; esac
+  jq -nc --arg ts "$(now)" --argjson ms "$ms" --arg sp "$1" --arg f "$2" --arg t "$3" \
+         --arg d "$4" --arg g "$5" \
+    '{level: (if $g == "fail" then 40 else 30 end),
+      time: $ms,
+      name: "sprint",
+      msg: "\($sp)  \($f) → \($t)  \($d)  gate=\($g)",
+      ts:$ts, sprint:$sp, from:$f, to:$t, direction:$d, gate:$g}' \
+    >> "$dir/stage-transitions.jsonl" 2>/dev/null || true
+  return 0
+}
+
+# ── stage rank (used to judge advance / rollback) ──
+# build-* are sub-phases in the BUILD band.
+rank() {
+  case "$1" in
+    PLAN)         echo 10 ;;
+    REVIEW)       echo 20 ;;
+    build-red)    echo 30 ;;
+    BUILD)        echo 31 ;;
+    TEST)         echo 40 ;;
+    DOCS)         echo 50 ;;
+    SHIP)         echo 60 ;;
+    CLOSED)       echo 70 ;;
+    *)            echo -1 ;;
+  esac
+}
+
+# For each stage, the set of "next stages allowed on advance"
+allowed_next() {
+  case "$1" in
+    PLAN)      echo "REVIEW" ;;
+    REVIEW)    echo "build-red" ;;
+    build-red) echo "BUILD" ;;
+    BUILD)     echo "TEST" ;;
+    TEST)      echo "DOCS" ;;
+    DOCS)      echo "SHIP" ;;
+    SHIP)      echo "CLOSED" ;;
+    CLOSED)    echo "" ;;
+    *)         echo "" ;;
+  esac
+}
+
+require_flags() { [ -f "$FLAGS" ] || die "flags.json not found: $FLAGS (create it with new)"; }
+
+active_id() { jq -r '.active // ""' "$FLAGS"; }
+
+write_flags() { # stdin = new JSON
+  local tmp; tmp=$(mktemp)
+  cat > "$tmp"
+  mv "$tmp" "$FLAGS"
+}
+
+cmd_stage() {
+  require_flags
+  local to="$1"
+  [ -n "$to" ] || die "specify the target stage: stage <STAGE>"
+  [ "$(rank "$to")" -ge 0 ] || die "unknown stage: $to"
+
+  local id cur
+  id=$(active_id); [ -n "$id" ] || die "no active sprint is set."
+  cur=$(jq -r --arg id "$id" '.sprints[$id].stage // ""' "$FLAGS")
+  [ -n "$cur" ] || die "cannot read the current stage."
+
+  local gate_result="none"
+  if [ "$cur" = "$to" ]; then
+    # Setting the same stage again is allowed (sets status back to open)
+    log_transition "$id" "$cur" "$to" same none
+  elif grep -qx "$to" <<<"$(allowed_next "$cur" | tr ' ' '\n')"; then
+    # Gate check on stage advance
+    if [ -f "$HARNESS/tools/gate-check.sh" ]; then
+      # Run the check when the gates in the config define the target stage
+      local has_checks kind
+      kind="code"
+      [ -f "$FLAGS" ] && kind=$(jq -r --arg id "$id" '.sprints[$id].kind // "code"' "$FLAGS" 2>/dev/null || echo "code")
+      has_checks=$(jq -r --arg k "$kind" --arg s "$to" 'if .gates[$k][$s] and (.gates[$k][$s] | length > 0) then "yes" else "no" end' "$(sprint_config_path)" 2>/dev/null || echo "no")
+      if [ "$has_checks" = "yes" ]; then
+        echo "sprint: running the $to gate check..." >&2
+        if bash "$HARNESS/tools/gate-check.sh" "$to"; then
+          gate_result="pass"
+        else
+          log_transition "$id" "$cur" "$to" forward fail
+          die "gate check failed. Fix the problems above, then run stage $to again."
+        fi
+      fi
+    fi
+    log_transition "$id" "$cur" "$to" forward "$gate_result"
+  elif [ "$(rank "$to")" -lt "$(rank "$cur")" ]; then
+    echo "sprint: ${cur} → ${to} (rollback)" >&2
+    if [ "$to" = "PLAN" ]; then
+      echo "sprint: back to PLAN. Fix SPEC.md/TEST.md (seal after REVIEW and before build-red with 'bash harness/bin/sprint seal')." >&2
+    fi
+    log_transition "$id" "$cur" "$to" rollback none
+  else
+    log_transition "$id" "$cur" "$to" denied none
+    die "stage skip is not allowed: ${cur} → ${to}. Allowed advance: [$(allowed_next "$cur")] (or rollback to an earlier stage)"
+  fi
+
+  # Token usage snapshot per stage (finalizes the previous stage).
+  # Record it now, when the advance to the next stage is judged allowed. A failure does not stop the transition.
+  if [ "$cur" != "$to" ] && [ -f "$HARNESS/tools/stage-tokens.sh" ]; then
+    bash "$HARNESS/tools/stage-tokens.sh" "$id" "$cur" "$to" >/dev/null 2>&1 || true
+  fi
+
+  jq --arg id "$id" --arg s "$to" --arg ts "$(now)" \
+    '.sprints[$id].stage=$s | .sprints[$id].status="open" | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} stage=${to} status=open"
+}
+
+cmd_set_status() {
+  require_flags
+  local st="$1"
+  case "$st" in open|doing|closed) ;; *) die "status must be one of open|doing|closed: $st" ;; esac
+  local id; id=$(active_id); [ -n "$id" ] || die "no active sprint is set."
+  jq --arg id "$id" --arg st "$st" --arg ts "$(now)" \
+    '.sprints[$id].status=$st | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} status=${st}"
+}
+
+cmd_new() {
+  local id="$1" dir="$2" kind="${3:-code}"
+  [ -n "$id" ] && [ -n "$dir" ] || die "usage: new <sprint_id> <sprint_dir> [code|docs]"
+  case "$kind" in code|docs) ;; *) die "kind must be one of code|docs: $kind" ;; esac
+  if [ ! -f "$FLAGS" ]; then
+    mkdir -p "$(dirname "$FLAGS")"
+    echo '{"active":"","sprints":{}}' > "$FLAGS"
+  fi
+  jq -e --arg id "$id" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 && die "sprint already exists: $id"
+
+  local templates f
+  templates=$(sprint_abs_path "$(sprint_config '.docs.templates')")
+  for f in README.md SPEC.md TEST.md; do
+    [ -f "$templates/$f" ] || { echo "sprint: templates not found: $templates" >&2; exit 4; }
+  done
+  mkdir -p "$ROOT/$dir"
+  for f in README.md SPEC.md TEST.md; do
+    [ -f "$ROOT/$dir/$f" ] || cp "$templates/$f" "$ROOT/$dir/$f"
+  done
+
+  jq --arg id "$id" --arg dir "$dir" --arg kind "$kind" --arg ts "$(now)" \
+    '.sprints[$id]={stage:"PLAN",status:"open",sprint_dir:$dir,kind:$kind,updated_at:$ts} | .active=$id' \
+    "$FLAGS" | write_flags
+  echo "sprint: created ${id} (stage=PLAN, kind=${kind}) dir=${dir} active=${id}"
+  echo "sprint: draft SPEC.md/TEST.md (seal after REVIEW and before build-red with 'bash harness/bin/sprint seal')."
+}
+
+cmd_switch() {
+  require_flags
+  local id="$1"
+  [ -n "$id" ] || die "specify the sprint_id to switch to: switch <id>"
+  jq -e --arg id "$id" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 || die "no such sprint: $id"
+  jq --arg id "$id" '.active=$id' "$FLAGS" | write_flags
+  echo "sprint: active=${id}"
+}
+
+cmd_get() {
+  require_flags
+  local field="${1:-stage}"
+  local id; id=$(active_id); [ -n "$id" ] || die "no active sprint is set."
+  jq -r --arg id "$id" --arg f "$field" '.sprints[$id][$f] // ""' "$FLAGS"
+}
+
+# ── state aggregation ──
+# Make the scattered state (flags / seal manifest / test failure count / freshness of execution evidence /
+# recent transitions) readable with one command.
+# Do not create a new state file — only read and aggregate the existing sources.
+# The task table in README §3 stays the only source (do not copy it here).
+cmd_status() {
+  require_flags
+  local as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+
+  local id; id=$(active_id); [ -n "$id" ] || die "no active sprint is set."
+
+  local dir kind stage st updated
+  dir=$(jq -r --arg id "$id" '.sprints[$id].sprint_dir // ""' "$FLAGS")
+  kind=$(jq -r --arg id "$id" '.sprints[$id].kind // "code"' "$FLAGS")
+  stage=$(jq -r --arg id "$id" '.sprints[$id].stage // ""' "$FLAGS")
+  st=$(jq -r --arg id "$id" '.sprints[$id].status // ""' "$FLAGS")
+  updated=$(jq -r --arg id "$id" '.sprints[$id].updated_at // ""' "$FLAGS")
+
+  # Seal state (whether the manifest has an entry)
+  local sealed_spec="false" sealed_test="false"
+  local manifest="$ROOT/.sprint/spec-hashes.json"
+  if [ -f "$manifest" ] && [ -n "$dir" ]; then
+    if jq -e --arg k "$dir/SPEC.md" 'has($k)' "$manifest" >/dev/null 2>&1; then sealed_spec="true"; fi
+    if jq -e --arg k "$dir/TEST.md" 'has($k)' "$manifest" >/dev/null 2>&1; then sealed_test="true"; fi
+  fi
+
+  # Test failure count
+  local fails="null"
+  if [ -f "$ROOT/.sprint/test-fails.json" ]; then
+    fails=$(jq -c '.' "$ROOT/.sprint/test-fails.json" 2>/dev/null || echo "null")
+  fi
+
+  # Freshness of execution evidence (reuses the same judgment as the fresh check of the results gate)
+  local fresh="false"
+  if [ -f "$HARNESS/gate-tools/results.sh" ]; then
+    if bash "$HARNESS/gate-tools/results.sh" fresh >/dev/null 2>&1; then fresh="true"; fi
+  fi
+
+  # Recent transitions
+  local trans="[]"
+  local tlog="$ROOT/.sprint/logs/stage-transitions.jsonl"
+  if [ -f "$tlog" ]; then
+    trans=$(tail -5 "$tlog" | jq -s '.' 2>/dev/null || echo "[]")
+  fi
+
+  if [ "$as_json" -eq 1 ]; then
+    jq -n --arg id "$id" --arg stage "$stage" --arg st "$st" --arg kind "$kind" \
+          --arg dir "$dir" --arg updated "$updated" \
+          --argjson sspec "$sealed_spec" --argjson stest "$sealed_test" \
+          --argjson fails "$fails" --argjson fresh "$fresh" \
+          --argjson trans "$trans" \
+      '{active:$id, stage:$stage, status:$st, kind:$kind, sprint_dir:$dir, updated_at:$updated,
+        sealed:{SPEC:$sspec, TEST:$stest},
+        test_fails:$fails, results_fresh:$fresh,
+        recent_transitions:$trans}'
+    return 0
+  fi
+
+  local m_spec="✗" m_test="✗" m_fresh="stale (not run after source changes)"
+  [ "$sealed_spec" = "true" ] && m_spec="✓"
+  [ "$sealed_test" = "true" ] && m_test="✓"
+  [ "$fresh" = "true" ] && m_fresh="fresh"
+
+  printf 'Sprint:   %s  [%s / %s]  kind=%s\n' "$id" "$stage" "$st" "$kind"
+  printf 'Dir:      %s\n' "$dir"
+  printf 'Updated:  %s\n\n' "$updated"
+  printf 'Sealed:   SPEC.md %s   TEST.md %s\n' "$m_spec" "$m_test"
+  if [ "$fails" = "null" ]; then
+    printf 'Tests:    (no record)\n'
+  else
+    printf 'Tests:    %s failed  %s\n' \
+      "$(jq -r '.total // 0' <<<"$fails")" \
+      "$(jq -r '[.tasks // {} | to_entries[] | "\(.key) \(.value)"] | join(" / ")' <<<"$fails")"
+  fi
+  printf 'Evidence: %s\n' "$m_fresh"
+
+  if [ "$(jq 'length' <<<"$trans")" -gt 0 ]; then
+    printf '\nRecent transitions:\n'
+    jq -r '.[] | "  \(.time)  \(.from) → \(.to)  \(.direction)  gate=\(.gate)"' <<<"$trans"
+  fi
+}
+
+# List of all sprints (the former bash harness/bin/sprint status)
+cmd_list() {
+  require_flags
+  jq -r '"active: \(.active)", (.sprints | to_entries[] | "  \(.key)\t\(.value.stage)\t\(.value.status)\t\(.value.sprint_dir)")' "$FLAGS"
+}
+
+# ── process observation ──
+# Aggregation and recent history of the stage transition log. It finds by numbers which stage causes rework and which gate
+# fails (used to choose the targets of process improvement).
+cmd_log() {
+  local tlog="$ROOT/.sprint/logs/stage-transitions.jsonl"
+  [ -f "$tlog" ] || { echo "(no transition log. Each stage transition is recorded)"; return 0; }
+
+  echo "=== Summary ==="
+  jq -s -r '
+    "Transitions   : \(length)",
+    "  Advance     : \([.[]|select(.direction=="forward")]|length)",
+    "  Rollback    : \([.[]|select(.direction=="rollback")]|length)",
+    "  Skip denied : \([.[]|select(.direction=="denied")]|length)",
+    "Gate failures : \([.[]|select(.gate=="fail")]|length)",
+    "",
+    "Gate failures (by target stage):",
+    ( [.[]|select(.gate=="fail")|.to] | group_by(.)
+      | if length==0 then ["  (none)"] else map("  \(.[0]): \(length)") end | .[] ),
+    "",
+    "Rollbacks (by source stage):",
+    ( [.[]|select(.direction=="rollback")|.from] | group_by(.)
+      | if length==0 then ["  (none)"] else map("  \(.[0]): \(length)") end | .[] )
+  ' "$tlog"
+
+  echo
+  echo "=== Last 20 ==="
+  tail -20 "$tlog" | jq -r '"  \(.time)  [\(.sprint)]  \(.from) → \(.to)  \(.direction)  gate=\(.gate)"'
+}
+
+cmd_set_kind() {
+  require_flags
+  local kind="$1"
+  case "$kind" in code|docs) ;; *) die "kind must be one of code|docs: $kind" ;; esac
+  local id; id=$(active_id); [ -n "$id" ] || die "no active sprint is set."
+  jq --arg id "$id" --arg kind "$kind" --arg ts "$(now)" \
+    '.sprints[$id].kind=$kind | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} kind=${kind}"
+}
+
+cmd_set_dir() {
+  require_flags
+  local dir="$1"
+  [ -n "$dir" ] || die "specify dir"
+  local id; id=$(active_id); [ -n "$id" ] || die "no active sprint is set."
+  jq --arg id "$id" --arg dir "$dir" --arg ts "$(now)" \
+    '.sprints[$id].sprint_dir=$dir | .sprints[$id].updated_at=$ts' \
+    "$FLAGS" | write_flags
+  echo "sprint: ${id} dir=${dir}"
+}
+
+# rename <old_id> <new_id> [dir]: change the ID. Keep stage / status / kind. When dir is given, change sprint_dir too.
+cmd_rename() {
+  require_flags
+  local old="$1" new="$2" dir="${3:-}"
+  [ -n "$old" ] && [ -n "$new" ] || die "usage: sprint.sh rename <old_id> <new_id> [dir]"
+  jq -e --arg id "$old" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 || die "sprint not registered: $old"
+  jq -e --arg id "$new" '.sprints[$id]' "$FLAGS" >/dev/null 2>&1 && die "sprint already exists: $new"
+  [ -z "$dir" ] || [ -d "$ROOT/$dir" ] || die "dir does not exist: $dir"
+  jq --arg old "$old" --arg new "$new" --arg dir "$dir" --arg ts "$(now)" '
+    .sprints[$new] = (.sprints[$old] | .updated_at = $ts | if $dir != "" then .sprint_dir = $dir else . end)
+    | del(.sprints[$old])
+    | if .active == $old then .active = $new else . end' "$FLAGS" | write_flags
+  echo "sprint: ${old} → ${new}${dir:+ dir=$dir}"
+}
+
+# ── task execution (task contract / evidence contract) ──
+# run <task>|all [<component>] [-- <extra args>...]
+#   In the order of tasks, process the components that have an adapter for <task>, in the config order.
+#   Per component: pre.<task> → the adapter's run-<verb> → convert-evidence <verb>.
+#   Exit code: 0 = every run-<verb> returned 0 / 2 = at least one non-zero (the rest still run. all fails fast per verb) /
+#              4 = pre failed or an adapter is not found (stops at once)
+#   A run with extra args is a partial run. It writes the evidence to <component>.<task>.partial.json.
+cmd_run() {
+  local task="${1:-}"; shift || true
+  [ -n "$task" ] || die "usage: run <task>|all [<component>] [-- <extra args>...]"
+  local only="" extra=() partial=""
+  if [ "${1:-}" != "--" ] && [ -n "${1:-}" ]; then only="$1"; shift; fi
+  if [ "${1:-}" = "--" ]; then shift; extra=("$@"); partial=".partial"; fi
+
+  local verbs
+  if [ "$task" = "all" ]; then
+    verbs=$(sprint_tasks)
+  else
+    grep -qx "$task" <<<"$(sprint_tasks)" || die "unknown task: ${task} (tasks: $(sprint_tasks | tr '\n' ' '))"
+    verbs="$task"
+  fi
+  if [ -n "$only" ]; then
+    grep -qx "$only" <<<"$(sprint_components)" || die "unknown component: $only"
+  fi
+
+  local adapters_dir evidence_dir
+  adapters_dir="${SPRINT_ADAPTERS_DIR:-$HARNESS/adapters}"
+  evidence_dir=$(evidence_dir)
+  mkdir -p "$evidence_dir"
+
+  local verb c adapter adapter_dir rverb pre comp_dir raw rc crc verb_rc total_rc=0 tmp
+  for verb in $verbs; do
+    verb_rc=0
+    for c in $(sprint_components); do
+      [ -z "$only" ] || [ "$c" = "$only" ] || continue
+      adapter=$(jq -r --arg c "$c" --arg t "$verb" '.components[$c].adapters[$t] // empty' "$(sprint_config_path)")
+      [ -n "$adapter" ] || continue
+      adapter_dir="$adapters_dir/$adapter"
+      [ -d "$adapter_dir" ] || { echo "sprint: adapter not found: ${adapter} ($c.${verb})"; exit 4; }
+      case "$verb" in e2e) rverb=test ;; *) rverb="$verb" ;; esac
+      comp_dir=$(sprint_abs_path "$(jq -r --arg c "$c" '.components[$c].dir // "."' "$(sprint_config_path)")")
+      raw="$evidence_dir/raw/$c.$verb"
+      mkdir -p "$raw"
+
+      export SPRINT_ROOT="$ROOT" SPRINT_COMPONENT="$c" SPRINT_COMPONENT_DIR="$comp_dir" \
+             SPRINT_TASK="$verb" SPRINT_RAW_DIR="$raw"
+
+      pre=$(jq -r --arg c "$c" --arg t "$verb" '.components[$c].pre[$t] // empty' "$(sprint_config_path)")
+      if [ -n "$pre" ]; then
+        set +e; (cd "$ROOT" && bash -c "$pre"); rc=$?; set -e
+        [ "$rc" -eq 0 ] || { echo "sprint: $c.$verb: pre failed (exit ${rc})"; exit 4; }
+      fi
+
+      echo "sprint: run $c.$verb ($adapter)"
+      set +e
+      (cd "$comp_dir" && "$adapter_dir/run-$rverb" "${extra[@]}") 2>&1 | tee "$raw/stdout.txt"
+      rc=${PIPESTATUS[0]}
+      tmp=$(mktemp)
+      SPRINT_RUN_EXIT="$rc" "$adapter_dir/convert-evidence" "$rverb" > "$tmp"; crc=$?
+      set -e
+      if [ "$crc" -eq 0 ]; then
+        mv "$tmp" "$evidence_dir/$c.$verb$partial.json"
+      else
+        rm -f "$tmp"
+        echo "sprint: $c.$verb: convert-evidence failed"
+        [ "$rc" -eq 0 ] && rc=1
+      fi
+      [ "$rc" -eq 0 ] || { verb_rc=2; echo "sprint: $c.$verb: failed (exit ${rc})"; }
+    done
+    if [ "$verb_rc" -ne 0 ]; then
+      total_rc=2
+      [ "$task" = "all" ] && break
+    fi
+  done
+  return "$total_rc"
+}
+
+SUB="${1:-}"; shift || true
+case "$SUB" in
+  stage)      cmd_stage "${1:-}" ;;
+  set-status) cmd_set_status "${1:-}" ;;
+  new)        cmd_new "${1:-}" "${2:-}" "${3:-}" ;;
+  switch)     cmd_switch "${1:-}" ;;
+  get)        cmd_get "${1:-}" ;;
+  status)     cmd_status "${1:-}" ;;
+  list)       cmd_list ;;
+  log)        cmd_log ;;
+  set-kind)   cmd_set_kind "${1:-}" ;;
+  set-dir)    cmd_set_dir "${1:-}" ;;
+  rename)     cmd_rename "${1:-}" "${2:-}" "${3:-}" ;;
+  # ── task execution (through the adapters. writes the evidence contract JSON) ──
+  run)         cmd_run "$@" ;;
+  # ── checks (delegate to other scripts. return their exit codes as is) ──
+  gate)        exec bash "$HARNESS/tools/gate-check.sh" "$@" ;;
+  seal)        exec bash "$HARNESS/tools/spec-seal.sh" seal ;;
+  seal-verify) exec bash "$HARNESS/tools/spec-seal.sh" verify ;;
+  spec-check)  exec bash "$HARNESS/tools/spec-check.sh" "$@" ;;
+  spec-lint)   exec bash "$HARNESS/gate-tools/spec-lint.sh" "$@" ;;
+  spec-graph)  [ $# -gt 0 ] || set -- verify; exec bash "$HARNESS/tools/spec-graph.sh" "$@" ;;
+  spec-coverage) exec bash "$HARNESS/tools/spec-coverage.sh" "$@" ;;
+  api-routes)  exec bash "$HARNESS/tools/api-routes.sh" verify ;;
+  size-audit)  exec bash "$HARNESS/gate-tools/size-audit.sh" ;;
+  *) die "unknown subcommand: '${SUB}'. state: stage|set-status|new|switch|get|status|list|log|set-kind|set-dir|rename / run: run / checks: gate|seal|seal-verify|spec-check|spec-lint|spec-graph|spec-coverage|api-routes|size-audit" ;;
+esac

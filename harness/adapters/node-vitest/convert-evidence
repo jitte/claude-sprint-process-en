@@ -1,0 +1,41 @@
+#!/bin/bash
+# node-vitest / convert-evidence <verb> — convert the vitest JSON (jest-compatible testResults) to the evidence contract JSON.
+#   tests[].file   = relative to SPRINT_COMPONENT_DIR
+#   tests[].name   = fullName
+#   tests[].status = passed / failed / skipped (pending and skipped) / todo
+#   counts         = passed / failed / skipped (todo is not counted)
+#   status         = pass when SPRINT_RUN_EXIT is 0 and failed = 0
+#
+# Output location fix: vitest 4 keeps the options (outputFile) of the reporter with the same name in the config file,
+# even when the CLI specifies the reporter. While the config file still has outputFile for the json reporter, the JSON
+# is written there. In that case, take the location from the line "JSON report written to <path>" of the text output.
+# When the reporter setting is removed from the config file (at the switch), the JSON is written to $SPRINT_RAW_DIR/result.json.
+set -u
+RAW="$SPRINT_RAW_DIR/result.json"
+RC="${SPRINT_RUN_EXIT:-0}"
+NOW=$(date +%s)
+if [ ! -f "$RAW" ] && [ -f "$SPRINT_RAW_DIR/stdout.txt" ]; then
+  written=$(grep -oE 'JSON report written to .+$' "$SPRINT_RAW_DIR/stdout.txt" | tail -1 | sed 's/^JSON report written to //')
+  [ -n "$written" ] && [ -f "$written" ] && RAW="$written"
+fi
+if [ ! -f "$RAW" ]; then
+  jq -nc --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --argjson now "$NOW" \
+    '{schemaVersion:1, component:$c, task:$t, adapter:"node-vitest", status:"fail",
+      counts:{passed:0,failed:0,skipped:0}, errors:1, warnings:0, tests:[], started_at:$now, finished_at:$now}'
+  exit 0
+fi
+jq -c --arg c "$SPRINT_COMPONENT" --arg t "$SPRINT_TASK" --arg dir "$SPRINT_COMPONENT_DIR/" \
+   --argjson rc "$RC" --argjson now "$NOW" '
+  def rel: if startswith($dir) then .[($dir | length):] else . end;
+  def st: if . == "pending" or . == "skipped" then "skipped" else . end;
+  [ .testResults[]? | .name as $f | .assertionResults[]?
+    | { file: ($f | rel), name: .fullName, status: (.status | st) } ] as $tests
+  | ($tests | map(select(.status == "passed")) | length) as $p
+  | ($tests | map(select(.status == "failed")) | length) as $f
+  | ($tests | map(select(.status == "skipped")) | length) as $s
+  | { schemaVersion: 1, component: $c, task: $t, adapter: "node-vitest",
+      status: (if $rc == 0 and $f == 0 then "pass" else "fail" end),
+      counts: { passed: $p, failed: $f, skipped: $s },
+      errors: 0, warnings: 0, tests: $tests,
+      started_at: ((.startTime // ($now * 1000)) / 1000 | floor),
+      finished_at: $now }' "$RAW"

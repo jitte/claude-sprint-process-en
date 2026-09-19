@@ -1,0 +1,5 @@
+#!/bin/bash
+# vite-build / run-build — launch vite build in the component directory (cwd).
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+exec ./node_modules/.bin/vite build "$@"

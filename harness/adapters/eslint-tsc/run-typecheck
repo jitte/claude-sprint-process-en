@@ -1,0 +1,10 @@
+#!/bin/bash
+# eslint-tsc / run-typecheck — launch tsc in the component directory (cwd).
+# When tsconfig.json has references, use tsc -b --force (checks all project references. --force prevents
+# an incremental build that prints nothing and leaves the evidence empty). Otherwise, use tsc --noEmit.
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+if [ -f tsconfig.json ] && jq -e '.references' tsconfig.json >/dev/null 2>&1; then
+  exec ./node_modules/.bin/tsc -b --force "$@"
+fi
+exec ./node_modules/.bin/tsc --noEmit "$@"

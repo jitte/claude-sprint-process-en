@@ -1,0 +1,6 @@
+#!/bin/bash
+# eslint-tsc / run-lint — launch eslint in the component directory (cwd).
+# --max-warnings 0: eslint returns exit 0 even with warnings. This makes the exit code agree with warnings in the evidence.
+set -u
+mkdir -p "$SPRINT_RAW_DIR"
+exec ./node_modules/.bin/eslint . --max-warnings 0 "$@"
